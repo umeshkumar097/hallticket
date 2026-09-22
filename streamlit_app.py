@@ -142,10 +142,18 @@ def append_log(conn, row):
         str(row.get("error",""))
     ))
     conn.commit()
+    return cur.lastrowid
 
-def update_log_status(conn, log_id, status, error=""):
+def update_log_status(conn, log_id, status, error="", recipients=None):
+    """Update the SAME log row in place (Pending -> Sent/Failed) so Resume never
+    sees an already-sent part as pending and never duplicates rows."""
     cur = conn.cursor()
-    cur.execute(f"UPDATE {LOG_TABLE} SET status=?, error=? WHERE id=?", (status, str(error), log_id))
+    if recipients is None:
+        cur.execute(f"UPDATE {LOG_TABLE} SET status=?, error=?, timestamp=? WHERE id=?",
+                    (status, str(error), datetime.now().strftime("%Y-%m-%d %H:%M:%S"), log_id))
+    else:
+        cur.execute(f"UPDATE {LOG_TABLE} SET status=?, error=?, recipients=?, timestamp=? WHERE id=?",
+                    (status, str(error), recipients, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), log_id))
     conn.commit()
 
 def fetch_stats(conn):
@@ -887,6 +895,7 @@ with col_opts:
             prog = st.progress(0)
             total_pending = len(pending)
             sent_count = 0
+            failed_count = 0
             try:
                 if protocol.startswith("SMTPS"):
                     server = smtplib.SMTP_SSL(smtp_host, int(smtp_port), timeout=60)
@@ -906,11 +915,16 @@ with col_opts:
                     # recipients stored as comma-separated; allow override if testing default on
                     target_to = test_email if testing_mode_default else item["recipients"]
                     msg["To"] = target_to
+                    _pn, _pt = item["part"].split("/")[0], item["part"].split("/")[-1]
                     try:
-                        msg["Subject"] = subject_template.format(location=item["location"], part=item["part"].split("/")[0], total=item["part"].split("/")[-1])
+                        msg["Subject"] = subject_template.format(location=item["location"], part=_pn, total=_pt)
                     except:
                         msg["Subject"] = f"{item['location']} {item['part']}"
-                    msg.set_content(f"Resuming send for {item['location']} — part {item['part']}")
+                    try:
+                        body_txt = body_template.format(location=item["location"], part=_pn, total=_pt)
+                    except:
+                        body_txt = f"Please find attached part {item['part']} for {item['location']}."
+                    msg.set_content(body_txt)
                     # locate file path: DB file_path is primary (crash-safe), session_state is fallback
                     fname = item["file"]
                     ppath = item.get("file_path", "")  # from DB — works after crash/restart
@@ -921,16 +935,18 @@ with col_opts:
                                 ppath = r["Path"]
                                 break
                     if not ppath or not os.path.exists(ppath):
-                        append_log(conn, {"location": item["location"], "recipients": item["recipients"], "halltickets": item.get("halltickets",[]), "part": item["part"], "file": fname, "file_path": "", "files_in_part": item.get("files_in_part",0), "status": "Failed", "error": "Prepared file missing on server"})
+                        update_log_status(conn, item["id"], "Failed", "Prepared file missing on server — run Prepare ZIPs again")
+                        prog.progress(int(i/total_pending*100))
                         continue
                     with open(ppath, "rb") as af:
                         msg.add_attachment(af.read(), maintype="application", subtype="zip", filename=os.path.basename(ppath))
                     try:
                         server.send_message(msg)
-                        append_log(conn, {"location": item["location"], "recipients": target_to, "halltickets": item.get("halltickets",[]), "part": item["part"], "file": fname, "files_in_part": item.get("files_in_part",0), "status": "Sent", "error": ""})
+                        update_log_status(conn, item["id"], "Sent", "", recipients=target_to)
+                        sent_count += 1
                     except Exception as e:
-                        append_log(conn, {"location": item["location"], "recipients": target_to, "halltickets": item.get("halltickets",[]), "part": item["part"], "file": fname, "files_in_part": item.get("files_in_part",0), "status": "Failed", "error": str(e)})
-                    sent_count += 1
+                        update_log_status(conn, item["id"], "Failed", str(e), recipients=target_to)
+                        failed_count += 1
                     rc += 1
                     prog.progress(int(i/total_pending*100))
                     if rc >= RECONNECT_EVERY:
@@ -947,7 +963,7 @@ with col_opts:
                         time.sleep(float(delay_seconds))
                 try: server.quit()
                 except: pass
-                status_ph.success("Resume finished (see DB logs).")
+                status_ph.success(f"Resume finished — {sent_count} sent, {failed_count} failed out of {total_pending} pending.")
             except Exception as e:
                 st.error("Resume failed: " + str(e))
 
@@ -976,16 +992,16 @@ with col_send:
                 failed_ph   = m3.empty()
                 feed_ph     = st.empty()   # live scrolling table
 
-                def _refresh_ui(sent, failed, total, log_rows):
-                    pct = int(sent / total * 100)
+                def _refresh_ui(done, sent, failed, total, log_rows):
+                    pct = int(done / total * 100)
                     prog.progress(pct)
                     pct_ph.markdown(
                         f"<div style='font-size:1.1rem;font-weight:700;color:#1d4ed8'>"
-                        f"{pct}%  —  {sent} of {total} sent</div>",
+                        f"{pct}%  —  {done} of {total} processed</div>",
                         unsafe_allow_html=True
                     )
                     sent_ph.metric("Sent", sent)
-                    remain_ph.metric("Remaining", total - sent)
+                    remain_ph.metric("Remaining", total - done)
                     failed_ph.metric("Failed", failed)
                     if log_rows:
                         feed_ph.dataframe(
@@ -995,7 +1011,8 @@ with col_send:
                         )
 
                 # initial state
-                _refresh_ui(0, 0, total_parts, [])
+                done_count = 0
+                _refresh_ui(0, 0, 0, total_parts, [])
 
                 try:
                     if protocol.startswith("SMTPS"):
@@ -1034,18 +1051,20 @@ with col_send:
                             msg.set_content(body_txt)
                             with open(pinfo["path"], "rb") as af:
                                 msg.add_attachment(af.read(), maintype="application", subtype="zip", filename=os.path.basename(pinfo["path"]))
-                            append_log(conn, {"location": loc, "recipients": recip_str, "halltickets": hall_list, "part": f"{idx_part}/{len(parts)}", "file": os.path.basename(pinfo["path"]), "file_path": pinfo["path"], "files_in_part": len(pinfo["files"]), "status": "Pending", "error": ""})
+                            # One log row per part: written as Pending, then updated in place to Sent/Failed.
+                            log_id = append_log(conn, {"location": loc, "recipients": target_to, "halltickets": hall_list, "part": f"{idx_part}/{len(parts)}", "file": os.path.basename(pinfo["path"]), "file_path": pinfo["path"], "files_in_part": len(pinfo["files"]), "status": "Pending", "error": ""})
                             try:
                                 server.send_message(msg)
-                                append_log(conn, {"location": loc, "recipients": target_to, "halltickets": hall_list, "part": f"{idx_part}/{len(parts)}", "file": os.path.basename(pinfo["path"]), "file_path": pinfo["path"], "files_in_part": len(pinfo["files"]), "status": "Sent", "error": ""})
+                                update_log_status(conn, log_id, "Sent", "")
+                                sent_count += 1
                                 logs.append({"Location": loc, "Halltickets": hall, "To": target_to, "Part": f"{idx_part}/{len(parts)}", "File": os.path.basename(pinfo["path"]), "Status": "Sent"})
                             except Exception as e:
                                 failed_count += 1
-                                append_log(conn, {"location": loc, "recipients": target_to, "halltickets": hall_list, "part": f"{idx_part}/{len(parts)}", "file": os.path.basename(pinfo["path"]), "file_path": pinfo["path"], "files_in_part": len(pinfo["files"]), "status": "Failed", "error": str(e)})
+                                update_log_status(conn, log_id, "Failed", str(e))
                                 logs.append({"Location": loc, "Halltickets": hall, "To": target_to, "Part": f"{idx_part}/{len(parts)}", "File": os.path.basename(pinfo["path"]), "Status": f"Failed: {e}"})
-                            sent_count += 1
+                            done_count += 1
                             rc += 1
-                            _refresh_ui(sent_count, failed_count, total_parts, logs)
+                            _refresh_ui(done_count, sent_count, failed_count, total_parts, logs)
                             if rc >= RECONNECT_EVERY:
                                 try: server.quit()
                                 except: pass
