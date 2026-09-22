@@ -198,7 +198,10 @@ with st.sidebar:
 
     st.divider()
     st.markdown("**SMTP Credentials**")
-    smtp_creds = st.secrets.get("smtp_credentials", {})
+    try:
+        smtp_creds = dict(st.secrets.get("smtp_credentials", {}))
+    except Exception:
+        smtp_creds = {}   # no secrets.toml (local run) — fields stay empty, user types them in
 
     col_s1, col_s2 = st.columns(2)
     with col_s1:
@@ -218,7 +221,7 @@ with st.sidebar:
     st.divider()
     st.markdown("**Test Mode**")
     testing_mode_default = st.checkbox("Override recipients (test mode)", value=True)
-    test_email_default = st.text_input("Test email address", value=st.secrets.get("smtp_credentials", {}).get("default_test_email", ""))
+    test_email_default = st.text_input("Test email address", value=smtp_creds.get("default_test_email", ""))
 
 # ---------------- Send Log Stats — metric cards at top ----------------
 stats = fetch_stats(conn)
@@ -350,6 +353,59 @@ def create_chunked_zips_with_counts(file_paths, out_dir, base_name, max_bytes):
 
     return parts
 
+def hallticket_from_filename(fn: str) -> str:
+    """Return the hallticket number encoded in a PDF filename.
+    Prefers the last 9-digit group; falls back to the last group with >=6 digits,
+    then to the last digit group of any length. Returns "" if no digits."""
+    stem = os.path.splitext(fn)[0]
+    all_groups = re.findall(r"\d+", stem)
+    if not all_groups:
+        return ""
+    nine = [g for g in all_groups if len(g) == 9]
+    if nine:
+        return nine[-1]
+    six = [g for g in all_groups if len(g) >= 6]
+    if six:
+        return six[-1]
+    return all_groups[-1]
+
+def build_pdf_index(pdf_map: dict) -> dict:
+    """hallticket digits -> sorted list of PDF filenames. Built once per ZIP,
+    so every Excel row lookup is O(1) instead of scanning all PDFs."""
+    idx = defaultdict(list)
+    for fn in pdf_map:
+        ht = hallticket_from_filename(fn)
+        if ht:
+            idx[ht].append(fn)
+    return {k: sorted(set(v)) for k, v in idx.items()}
+
+def matched_pdfs_for_hall(hall: str, pdf_index: dict) -> list:
+    """Filenames whose extracted hallticket exactly equals the Excel hallticket digits."""
+    if not hall or hall in ("", "nan", "SR NO", "HALLTICKET", "HALL TICKET", "HT NO"):
+        return []
+    return pdf_index.get(re.sub(r"\D", "", hall), [])
+
+@st.cache_data(show_spinner=False)
+def load_table(file_bytes: bytes, file_name: str) -> pd.DataFrame:
+    """Read the uploaded Excel/CSV once per file content; reruns hit the cache."""
+    bio = io.BytesIO(file_bytes)
+    if file_name.lower().endswith(".csv"):
+        df = pd.read_csv(bio, dtype=str).fillna("")
+    else:
+        df = pd.read_excel(bio, dtype=str).fillna("")
+    # Deduplicate column names (e.g. 'Hallticket No', 'Hallticket No' -> 'Hallticket No', 'Hallticket No_1')
+    seen = {}
+    new_cols = []
+    for col in df.columns:
+        if col in seen:
+            seen[col] += 1
+            new_cols.append(f"{col}_{seen[col]}")
+        else:
+            seen[col] = 0
+            new_cols.append(col)
+    df.columns = new_cols
+    return df
+
 def make_download_zip(paths, out_path):
     with zipfile.ZipFile(out_path, 'w', compression=zipfile.ZIP_DEFLATED) as z:
         for p in paths:
@@ -405,11 +461,28 @@ if "zip_extracted_for" not in st.session_state: st.session_state.zip_extracted_f
 if "mapping_cache_key" not in st.session_state: st.session_state.mapping_cache_key = None
 if "mapping_rows" not in st.session_state: st.session_state.mapping_rows = []
 if "excel_halls" not in st.session_state: st.session_state.excel_halls = []
+if "pdf_index" not in st.session_state: st.session_state.pdf_index = {}
+if "reverse_rows" not in st.session_state: st.session_state.reverse_rows = []
+if "group_cache_key" not in st.session_state: st.session_state.group_cache_key = None
+if "group_summary_rows" not in st.session_state: st.session_state.group_summary_rows = []
 
 status_ph = st.empty()
 
 # ---------------- Upload ----------------
 st.subheader("Step 1 — Upload Files")
+client_mode = st.selectbox(
+    "Client Mode",
+    ["TVS", "Other"],
+    index=0,
+    key="client_mode",
+    help="TVS: one email per hallticket (row emails = manager + student). "
+         "Other: all halltickets of a location with the same email list go together in one ZIP, split into parts under the size limit.",
+)
+if client_mode == "TVS":
+    st.caption("TVS mode — each hallticket is zipped and emailed separately to the emails on its row.")
+else:
+    st.caption("Other mode — halltickets are grouped by Location + Emails, zipped together, chunked under the max attachment size, and each part is sent to the common emails.")
+
 col1, col2 = st.columns(2)
 with col1:
     uploaded_excel = st.file_uploader("Excel file (.xlsx or .csv)  —  must have Hallticket, Email, Location columns", type=["xlsx","csv"], key="upl_excel")
@@ -422,21 +495,7 @@ if not (uploaded_excel and uploaded_zip):
 
 # ---------------- Read Excel ----------------
 try:
-    if uploaded_excel.name.lower().endswith(".csv"):
-        df = pd.read_csv(uploaded_excel, dtype=str).fillna("")
-    else:
-        df = pd.read_excel(uploaded_excel, dtype=str).fillna("")
-    # Deduplicate column names (e.g. 'Hallticket No', 'Hallticket No' → 'Hallticket No', 'Hallticket No_1')
-    seen = {}
-    new_cols = []
-    for col in df.columns:
-        if col in seen:
-            seen[col] += 1
-            new_cols.append(f"{col}_{seen[col]}")
-        else:
-            seen[col] = 0
-            new_cols.append(col)
-    df.columns = new_cols
+    df = load_table(uploaded_excel.getvalue(), uploaded_excel.name)
 except Exception as e:
     st.error("Failed to read Excel: " + str(e))
     st.stop()
@@ -483,13 +542,17 @@ if st.session_state.get("zip_extracted_for") != _zip_key:
             if f.lower().endswith(".pdf"):
                 pdf_map[f] = os.path.join(root, f)
     st.session_state.pdf_map = pdf_map
+    st.session_state.pdf_index = build_pdf_index(pdf_map)
     st.session_state.zip_extracted_for = _zip_key
     status_ph.success(f"Extracted {len(pdf_map)} PDFs into workspace.")
 else:
     # Same ZIP — reuse already-extracted files instantly
     workdir = st.session_state.workdir
     pdf_map = st.session_state.pdf_map
+    if not st.session_state.get("pdf_index") and pdf_map:
+        st.session_state.pdf_index = build_pdf_index(pdf_map)
     status_ph.success(f"Using cached workspace — {len(pdf_map)} PDFs ready.")
+pdf_index = st.session_state.pdf_index
 
 # ---------------- Mapping Excel → PDF — cached per column selection ----------------
 _mapping_key = f"{getattr(uploaded_excel,'file_id',uploaded_excel.name)}|{_zip_key}|{ht_col}|{email_col}|{loc_col}"
@@ -508,23 +571,8 @@ else:
         raw_emails = str(row[email_col]).strip() if email_col in row.index else str(row.iloc[1]).strip()
         location = str(row[loc_col]).strip() if loc_col in row.index else str(row.iloc[2]).strip()
         excel_halls.append(hall)
-        matched_files = []
-        if hall and hall not in ("", "nan", "SR NO", "HALLTICKET", "HALL TICKET", "HT NO"):
-            # Strict: extract last 9-digit group from each filename and compare exactly
-            hall_digits = re.sub(r"\D", "", hall)
-            for fn, path in pdf_map.items():
-                stem = os.path.splitext(fn)[0]
-                all_groups = re.findall(r"\d+", stem)
-                # Prefer 9-digit groups; fallback to last group with >=6 digits
-                nine_digit = [g for g in all_groups if len(g) == 9]
-                fn_ht = nine_digit[-1] if nine_digit else (
-                    [g for g in all_groups if len(g) >= 6][-1] if any(len(g) >= 6 for g in all_groups)
-                    else (all_groups[-1] if all_groups else "")
-                )
-                if fn_ht and fn_ht == hall_digits:
-                    matched_files.append(fn)
-
-        matched_files = sorted(set(matched_files))
+        # Strict match via prebuilt index: filename hallticket == Excel hallticket digits
+        matched_files = matched_pdfs_for_hall(hall, pdf_index)
         # Extract exam password from the first matched PDF (cached by @st.cache_data)
         password = ""
         for fn in matched_files:
@@ -572,21 +620,26 @@ st.dataframe(map_df, use_container_width=True)
 
 # Reverse mapping — collapsed by default
 with st.expander("Reverse mapping  (PDF → Excel detect)", expanded=False):
-    pdf_reverse_rows = []
-    excel_set = set([str(x).strip().lower() for x in excel_halls if str(x).strip() != ""])
-    for fn, p in pdf_map.items():
-        fn_low = fn.lower()
-        digits = re.findall(r"\d{4,20}", fn_low)
-        matched_hall = ""
-        for d in digits:
-            if d in excel_set:
-                matched_hall = d
-                break
-        if not matched_hall and digits:
-            last = digits[-1]
-            if last in excel_set:
-                matched_hall = last
-        pdf_reverse_rows.append({"PDFFile": fn, "DetectedHallticket": matched_hall or "", "MatchedInExcel": bool(matched_hall)})
+    if st.session_state.get("reverse_cache_key") == _mapping_key:
+        pdf_reverse_rows = st.session_state.reverse_rows
+    else:
+        pdf_reverse_rows = []
+        excel_set = set([str(x).strip().lower() for x in excel_halls if str(x).strip() != ""])
+        for fn, p in pdf_map.items():
+            fn_low = fn.lower()
+            digits = re.findall(r"\d{4,20}", fn_low)
+            matched_hall = ""
+            for d in digits:
+                if d in excel_set:
+                    matched_hall = d
+                    break
+            if not matched_hall and digits:
+                last = digits[-1]
+                if last in excel_set:
+                    matched_hall = last
+            pdf_reverse_rows.append({"PDFFile": fn, "DetectedHallticket": matched_hall or "", "MatchedInExcel": bool(matched_hall)})
+        st.session_state.reverse_rows = pdf_reverse_rows
+        st.session_state.reverse_cache_key = _mapping_key
     pdf_rev_df = pd.DataFrame(pdf_reverse_rows)
     extra_csv = pdf_rev_df[pdf_rev_df["MatchedInExcel"]==False].to_csv(index=False)
     st.caption(f"{len(pdf_rev_df)} total PDFs — {int(pdf_rev_df['MatchedInExcel'].sum())} matched, {int((~pdf_rev_df['MatchedInExcel']).sum())} extra")
@@ -595,33 +648,47 @@ with st.expander("Reverse mapping  (PDF → Excel detect)", expanded=False):
 
 st.divider()
 
-# Grouping: key = (location, recip_key, hall) — each hallticket isolated to its own bucket
-grouped = defaultdict(list)
-for idx, row in df.iterrows():
-    hall = str(row[ht_col]).strip() if ht_col in row.index else str(row.iloc[0]).strip()
-    raw_emails = str(row[email_col]).strip() if email_col in row.index else str(row.iloc[1]).strip()
-    location = str(row[loc_col]).strip() if loc_col in row.index else str(row.iloc[2]).strip()
-    emails = [e.strip().lower() for e in re.split(r"[,;\n]+", raw_emails) if e.strip()]
-    recip_key = tuple(sorted(emails))
-    # KEY includes hallticket — prevents cross-mixing of PDFs
-    grouped[(location, recip_key, hall)].append(hall)
-st.session_state.grouped = grouped
+# ---------------- Grouping — mode-aware, cached per (mapping, mode) ----------------
+# TVS   : key = (location, recip_key, hall)  -> every hallticket isolated in its own ZIP/email
+# Other : key = (location, recip_key, "")    -> all halltickets of a location sharing the same
+#                                               email list go into one ZIP (chunked into parts)
+_group_key = f"{_mapping_key}|{client_mode}"
+if st.session_state.get("group_cache_key") == _group_key and st.session_state.get("grouped"):
+    grouped = st.session_state.grouped
+    summary_rows_grp = st.session_state.group_summary_rows
+else:
+    grouped = defaultdict(list)
+    seen_in_group = set()
+    for m in mapping_rows:
+        hall = m["Hallticket"]
+        if not hall or hall in ("nan", "SR NO", "HALLTICKET", "HALL TICKET", "HT NO"):
+            continue
+        emails = [e.strip().lower() for e in re.split(r"[,;\n]+", m["Emails"]) if e.strip()]
+        recip_key = tuple(sorted(emails))
+        location = m["Location"]
+        gkey = (location, recip_key, hall) if client_mode == "TVS" else (location, recip_key, "")
+        if (gkey, hall) in seen_in_group:
+            continue  # duplicate Excel row for the same hallticket — don't attach the PDF twice
+        seen_in_group.add((gkey, hall))
+        grouped[gkey].append(hall)
+    grouped = dict(grouped)
+    summary_rows_grp = []
+    for (loc, recip_key, _h), halls in grouped.items():
+        matched_count = sum(len(matched_pdfs_for_hall(h, pdf_index)) for h in halls)
+        summary_rows_grp.append({
+            "Location": loc,
+            "Halltickets": ", ".join(halls),
+            "HallticketCount": len(halls),
+            "Recipients": ", ".join(recip_key),
+            "MatchedPDFs": matched_count,
+        })
+    st.session_state.grouped = grouped
+    st.session_state.group_summary_rows = summary_rows_grp
+    st.session_state.group_cache_key = _group_key
 
 # Group summary — collapsed by default
-with st.expander("Group summary  (Location + Recipients)", expanded=False):
-    summary_rows_grp = []
-    for (loc, recip_key, hall), halls in grouped.items():
-        matched_count = 1 if any(
-            re.sub(r"\D","",hall) == (
-                lambda groups: (
-                    [g for g in groups if len(g)==9][-1] if any(len(g)==9 for g in groups)
-                    else ([g for g in groups if len(g)>=6][-1] if any(len(g)>=6 for g in groups) else "")
-                )
-            )(re.findall(r"\d+", os.path.splitext(fn)[0]))
-            for fn in pdf_map
-        ) else 0
-        summary_rows_grp.append({"Location": loc, "Hallticket": hall, "Recipients": ", ".join(recip_key), "MatchedPDFs": matched_count})
-    st.dataframe(pd.DataFrame(summary_rows_grp))
+with st.expander(f"Group summary  ({client_mode} mode — {len(grouped)} groups)", expanded=False):
+    st.dataframe(pd.DataFrame(summary_rows_grp), use_container_width=True)
 
 st.divider()
 
@@ -650,41 +717,48 @@ with prep_col1:
         groups = list(grouped.items())
         total = max(1, len(groups))
         prog = st.progress(0)
-        for i, ((loc, recip_key, hall), halls) in enumerate(groups, start=1):
+        used_names = {}
+        for i, ((loc, recip_key, _h), halls) in enumerate(groups, start=1):
             if st.session_state.cancel_requested:
                 status_ph.warning("Preparation cancelled.")
                 break
-            # Strict match: find PDF whose last 9-digit group == hall digits
-            hall_digits = re.sub(r"\D", "", hall)
+            # Strict match via index: every hallticket in this group -> its PDF(s)
             matched_paths = []
-            for fn, p in pdf_map.items():
-                stem = os.path.splitext(fn)[0]
-                all_groups = re.findall(r"\d+", stem)
-                nine_digit = [g for g in all_groups if len(g) == 9]
-                fn_ht = nine_digit[-1] if nine_digit else (
-                    [g for g in all_groups if len(g) >= 6][-1] if any(len(g) >= 6 for g in all_groups)
-                    else (all_groups[-1] if all_groups else "")
-                )
-                if fn_ht and fn_ht == hall_digits:
-                    matched_paths.append(p)
+            for h in halls:
+                for fn in matched_pdfs_for_hall(h, pdf_index):
+                    matched_paths.append(pdf_map[fn])
+            matched_paths = sorted(set(matched_paths))
 
             recip_str = ", ".join(recip_key)
+            halls_key = tuple(halls)
             if not matched_paths:
-                prepared[(loc, recip_str, hall)] = []
+                prepared[(loc, recip_str, halls_key)] = []
                 prog.progress(int(i/total*100))
                 continue
-            safe_loc  = re.sub(r'[^A-Za-z0-9]', '_', loc)[:30]
-            safe_hall = re.sub(r'[^A-Za-z0-9]', '_', hall)[:20]
-            base_name = f"{safe_loc}_{safe_hall}"   # e.g. Pune_803038629
+            safe_loc = re.sub(r'[^A-Za-z0-9]', '_', loc)[:30]
+            if client_mode == "TVS":
+                safe_hall = re.sub(r'[^A-Za-z0-9]', '_', halls[0])[:20]
+                base_name = f"{safe_loc}_{safe_hall}"   # e.g. Pune_803038629
+            else:
+                base_name = safe_loc                     # e.g. Mumbai  -> Mumbai_part1.zip
+            # Same location with a different email list -> keep ZIP names unique
+            if base_name in used_names:
+                used_names[base_name] += 1
+                base_name = f"{base_name}_g{used_names[base_name]}"
+            else:
+                used_names[base_name] = 1
             out_dir = os.path.join(outroot, base_name)
             os.makedirs(out_dir, exist_ok=True)
             parts = create_chunked_zips_with_counts(matched_paths, out_dir, base_name=base_name, max_bytes=max_bytes)
-            prepared[(loc, recip_str, hall)] = parts
+            prepared[(loc, recip_str, halls_key)] = parts
             total_files_in_group = sum(len(pinfo["files"]) for pinfo in parts)
             for idx_part, pinfo in enumerate(parts, start=1):
+                # Halltickets actually inside this part (by filename)
+                part_halls = sorted({hallticket_from_filename(n) for n in pinfo["files"]} & set(re.sub(r"\D", "", h) for h in halls))
                 summary_rows.append({
                     "Location": loc,
-                    "Hallticket": hall,
+                    "Halltickets": ", ".join(part_halls),
+                    "HallticketCount": len(part_halls),
                     "Recipients": recip_str,
                     "Part": f"{idx_part}/{len(parts)}",
                     "File": os.path.basename(pinfo["path"]),
@@ -716,7 +790,7 @@ if st.session_state.get("summary_rows"):
     _p3.metric("Total Files", int(prep_df["FilesInPart"].sum()))
 
     st.download_button("Download prepared_summary.csv", data=prep_df.to_csv(index=False), file_name="prepared_summary.csv", mime="text/csv", key="dl_prep")
-    st.dataframe(prep_df[["Location","Recipients","Part","File","Size","FilesInPart","TotalFilesInGroup"]], use_container_width=True)
+    st.dataframe(prep_df[["Location","Halltickets","HallticketCount","Recipients","Part","File","Size","FilesInPart","TotalFilesInGroup"]], use_container_width=True)
 
     # Select and download individual part
     opts = [f"{r['Location']}  —  {r['File']}  ({r['Part']})  [{r['FilesInPart']} files]" for r in st.session_state["summary_rows"]]
@@ -762,7 +836,7 @@ with col_test:
                     server = smtplib.SMTP(smtp_host, int(smtp_port), timeout=60)
                     server.starttls()
                 server.login(sender_email, sender_pass)
-                for (loc, recip_str), parts in st.session_state.prepared.items():
+                for (loc, recip_str, halls_key), parts in st.session_state.prepared.items():
                     if not parts:
                         continue
                     first = parts[0]["path"]
@@ -783,7 +857,7 @@ with col_test:
                         msg.add_attachment(af.read(), maintype="application", subtype="zip", filename=os.path.basename(first))
                     server.send_message(msg)
                     # log test send as Sent in DB (so resume won't re-send)
-                    append_log(conn, {"location": loc, "recipients": test_email, "halltickets": [], "part": "1/1", "file": os.path.basename(first), "files_in_part": len(parts[0]["files"]) if parts else 0, "status": "Sent", "error": ""})
+                    append_log(conn, {"location": loc, "recipients": test_email, "halltickets": list(halls_key), "part": "1/1", "file": os.path.basename(first), "file_path": first, "files_in_part": len(parts[0]["files"]) if parts else 0, "status": "Sent", "error": ""})
                     sent = True
                     status_ph.success(f"Test email sent to {test_email} with {os.path.basename(first)}")
                     break
@@ -932,12 +1006,14 @@ with col_send:
                     server.login(sender_email, sender_pass)
                     RECONNECT_EVERY = 100
                     rc = 0
-                    for (loc, recip_str, hall), parts in st.session_state.prepared.items():
+                    for (loc, recip_str, halls_key), parts in st.session_state.prepared.items():
+                        hall = ", ".join(halls_key)          # display label for the log feed
+                        hall_list = list(halls_key)          # stored in DB for audit/resume
                         if st.session_state.cancel_requested:
                             status_ph.warning("Bulk send cancelled.")
                             break
                         if not parts:
-                            logs.append({"Location": loc, "Hallticket": hall, "To": recip_str, "Part": "", "File": "", "Status": "No parts"})
+                            logs.append({"Location": loc, "Halltickets": hall, "To": recip_str, "Part": "", "File": "", "Status": "No parts"})
                             continue
                         for idx_part, pinfo in enumerate(parts, start=1):
                             if st.session_state.cancel_requested:
@@ -958,15 +1034,15 @@ with col_send:
                             msg.set_content(body_txt)
                             with open(pinfo["path"], "rb") as af:
                                 msg.add_attachment(af.read(), maintype="application", subtype="zip", filename=os.path.basename(pinfo["path"]))
-                            append_log(conn, {"location": loc, "recipients": recip_str, "halltickets": [hall], "part": f"{idx_part}/{len(parts)}", "file": os.path.basename(pinfo["path"]), "file_path": pinfo["path"], "files_in_part": len(pinfo["files"]), "status": "Pending", "error": ""})
+                            append_log(conn, {"location": loc, "recipients": recip_str, "halltickets": hall_list, "part": f"{idx_part}/{len(parts)}", "file": os.path.basename(pinfo["path"]), "file_path": pinfo["path"], "files_in_part": len(pinfo["files"]), "status": "Pending", "error": ""})
                             try:
                                 server.send_message(msg)
-                                append_log(conn, {"location": loc, "recipients": target_to, "halltickets": [hall], "part": f"{idx_part}/{len(parts)}", "file": os.path.basename(pinfo["path"]), "file_path": pinfo["path"], "files_in_part": len(pinfo["files"]), "status": "Sent", "error": ""})
-                                logs.append({"Location": loc, "Hallticket": hall, "To": target_to, "Part": f"{idx_part}/{len(parts)}", "File": os.path.basename(pinfo["path"]), "Status": "Sent"})
+                                append_log(conn, {"location": loc, "recipients": target_to, "halltickets": hall_list, "part": f"{idx_part}/{len(parts)}", "file": os.path.basename(pinfo["path"]), "file_path": pinfo["path"], "files_in_part": len(pinfo["files"]), "status": "Sent", "error": ""})
+                                logs.append({"Location": loc, "Halltickets": hall, "To": target_to, "Part": f"{idx_part}/{len(parts)}", "File": os.path.basename(pinfo["path"]), "Status": "Sent"})
                             except Exception as e:
                                 failed_count += 1
-                                append_log(conn, {"location": loc, "recipients": target_to, "halltickets": [hall], "part": f"{idx_part}/{len(parts)}", "file": os.path.basename(pinfo["path"]), "file_path": pinfo["path"], "files_in_part": len(pinfo["files"]), "status": "Failed", "error": str(e)})
-                                logs.append({"Location": loc, "Hallticket": hall, "To": target_to, "Part": f"{idx_part}/{len(parts)}", "File": os.path.basename(pinfo["path"]), "Status": f"Failed: {e}"})
+                                append_log(conn, {"location": loc, "recipients": target_to, "halltickets": hall_list, "part": f"{idx_part}/{len(parts)}", "file": os.path.basename(pinfo["path"]), "file_path": pinfo["path"], "files_in_part": len(pinfo["files"]), "status": "Failed", "error": str(e)})
+                                logs.append({"Location": loc, "Halltickets": hall, "To": target_to, "Part": f"{idx_part}/{len(parts)}", "File": os.path.basename(pinfo["path"]), "Status": f"Failed: {e}"})
                             sent_count += 1
                             rc += 1
                             _refresh_ui(sent_count, failed_count, total_parts, logs)
@@ -1030,11 +1106,16 @@ if st.button("Clear workspace  (delete extracted and prepared files)"):
                     pass
         st.session_state.workdir = None
         st.session_state.pdf_map = {}
+        st.session_state.pdf_index = {}
         st.session_state.grouped = {}
         st.session_state.prepared = {}
         st.session_state.summary_rows = []
         st.session_state.cancel_requested = False
         st.session_state.verified = False
+        st.session_state.zip_extracted_for = None
+        st.session_state.mapping_cache_key = None
+        st.session_state.group_cache_key = None
+        st.session_state.reverse_cache_key = None
         status_ph.info("Workspace cleared. Upload new files to start again.")
     except Exception as e:
         st.error("Cleanup failed: " + str(e))
