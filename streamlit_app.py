@@ -7,7 +7,11 @@ Dependencies: streamlit, pandas
 
 import streamlit as st
 import pandas as pd
-import zipfile, os, io, tempfile, shutil, time, re, sqlite3, json
+import zipfile, os, io, tempfile, shutil, time, re, sqlite3, json, gc
+try:
+    import resource
+except ImportError:
+    resource = None
 try:
     import PyPDF2
 except ImportError:
@@ -16,6 +20,17 @@ from collections import defaultdict
 from email.message import EmailMessage
 import smtplib
 from datetime import datetime
+
+def rss_mb() -> float:
+    """Resident memory of this process in MB (0 if unavailable). Shown during
+    sending so a memory-limit kill on Streamlit Cloud can be seen coming."""
+    try:
+        if resource is None:
+            return 0.0
+        kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return round(kb / 1024.0, 1)
+    except Exception:
+        return 0.0
 
 # ---------------- Config ----------------
 # Use /tmp — writable on Streamlit Cloud (unlike /mount/src which is read-only)
@@ -227,6 +242,9 @@ with st.sidebar:
     max_mb = st.number_input("Max attachment size (MB)", value=3.0, step=0.5, min_value=0.5)
 
     st.divider()
+    st.caption(f"App memory in use: {rss_mb()} MB")
+
+    st.divider()
     st.markdown("**Test Mode**")
     testing_mode_default = st.checkbox("Override recipients (test mode)", value=True)
     test_email_default = st.text_input("Test email address", value=smtp_creds.get("default_test_email", ""))
@@ -262,6 +280,17 @@ def extract_zip_recursively(zip_file_like, extract_to):
                         extract_zip_recursively(nf, nested_dir)
                 except Exception:
                     continue
+
+def smtp_connect(host, port, use_ssl, user, password):
+    """Open + login one SMTP connection. Used for the initial connect and for
+    reconnects when the server drops the connection mid-batch."""
+    if use_ssl:
+        server = smtplib.SMTP_SSL(host, int(port), timeout=60)
+    else:
+        server = smtplib.SMTP(host, int(port), timeout=60)
+        server.starttls()
+    server.login(user, password)
+    return server
 
 def human_bytes(n):
     try: n = float(n)
@@ -497,9 +526,12 @@ with col1:
 with col2:
     uploaded_zip = st.file_uploader("ZIP file  —  contains all PDF hall tickets (nested ZIPs supported)", type=["zip"], key="upl_zip")
 
-if not (uploaded_excel and uploaded_zip):
+_zip_already_extracted = bool(st.session_state.get("zip_extracted_for")) and bool(st.session_state.get("pdf_map"))
+if not uploaded_excel or (not uploaded_zip and not _zip_already_extracted):
     st.info("Upload both files above to begin.")
     st.stop()
+if uploaded_zip is None and _zip_already_extracted:
+    st.caption("ZIP already extracted in this session — using the extracted workspace (ZIP removed from the uploader frees memory).")
 
 # ---------------- Read Excel ----------------
 try:
@@ -524,8 +556,8 @@ st.dataframe(df[[ht_col, email_col, loc_col]].head(8), use_container_width=True)
 
 
 # ---------------- Extract ZIP — only once per uploaded ZIP ----------------
-_zip_key = getattr(uploaded_zip, "file_id", uploaded_zip.name)
-if st.session_state.get("zip_extracted_for") != _zip_key:
+_zip_key = getattr(uploaded_zip, "file_id", uploaded_zip.name) if uploaded_zip is not None else st.session_state.get("zip_extracted_for")
+if uploaded_zip is not None and st.session_state.get("zip_extracted_for") != _zip_key:
     # New ZIP uploaded — reset workdir and extract fresh
     if st.session_state.workdir and os.path.exists(st.session_state.workdir):
         try:
@@ -538,8 +570,21 @@ if st.session_state.get("zip_extracted_for") != _zip_key:
     workdir = st.session_state.workdir
     status_ph.info("Extracting uploaded ZIP into workspace...")
     try:
-        bio = io.BytesIO(uploaded_zip.read())
-        extract_zip_recursively(bio, workdir)
+        # Stream the upload to disk in 8 MB chunks — no second full copy of the ZIP in RAM
+        # (kept OUTSIDE workdir so the nested-ZIP scan does not re-extract it)
+        _fd, zip_on_disk = tempfile.mkstemp(prefix="aiclex_upload_", suffix=".zip")
+        os.close(_fd)
+        uploaded_zip.seek(0)
+        with open(zip_on_disk, "wb") as zf_out:
+            shutil.copyfileobj(uploaded_zip, zf_out, length=8 * 1024 * 1024)
+        try:
+            extract_zip_recursively(zip_on_disk, workdir)
+        finally:
+            try:
+                os.remove(zip_on_disk)
+            except OSError:
+                pass
+        gc.collect()
     except Exception as e:
         st.error("ZIP extraction failed: " + str(e))
         st.stop()
@@ -552,7 +597,7 @@ if st.session_state.get("zip_extracted_for") != _zip_key:
     st.session_state.pdf_map = pdf_map
     st.session_state.pdf_index = build_pdf_index(pdf_map)
     st.session_state.zip_extracted_for = _zip_key
-    status_ph.success(f"Extracted {len(pdf_map)} PDFs into workspace.")
+    status_ph.success(f"Extracted {len(pdf_map)} PDFs into workspace. You may now remove the ZIP from the uploader to free memory.")
 else:
     # Same ZIP — reuse already-extracted files instantly
     workdir = st.session_state.workdir
@@ -838,12 +883,7 @@ with col_test:
             status_ph.info("Sending test email (first prepared part)...")
             sent = False
             try:
-                if protocol.startswith("SMTPS"):
-                    server = smtplib.SMTP_SSL(smtp_host, int(smtp_port), timeout=60)
-                else:
-                    server = smtplib.SMTP(smtp_host, int(smtp_port), timeout=60)
-                    server.starttls()
-                server.login(sender_email, sender_pass)
+                server = smtp_connect(smtp_host, smtp_port, protocol.startswith("SMTPS"), sender_email, sender_pass)
                 for (loc, recip_str, halls_key), parts in st.session_state.prepared.items():
                     if not parts:
                         continue
@@ -897,13 +937,9 @@ with col_opts:
             sent_count = 0
             failed_count = 0
             try:
-                if protocol.startswith("SMTPS"):
-                    server = smtplib.SMTP_SSL(smtp_host, int(smtp_port), timeout=60)
-                else:
-                    server = smtplib.SMTP(smtp_host, int(smtp_port), timeout=60)
-                    server.starttls()
-                server.login(sender_email, sender_pass)
-                RECONNECT_EVERY = 100
+                _use_ssl = protocol.startswith("SMTPS")
+                server = smtp_connect(smtp_host, smtp_port, _use_ssl, sender_email, sender_pass)
+                RECONNECT_EVERY = 25
                 rc = 0
                 for i, item in enumerate(pending, start=1):
                     if st.session_state.cancel_requested:
@@ -941,23 +977,27 @@ with col_opts:
                     with open(ppath, "rb") as af:
                         msg.add_attachment(af.read(), maintype="application", subtype="zip", filename=os.path.basename(ppath))
                     try:
-                        server.send_message(msg)
+                        try:
+                            server.send_message(msg)
+                        except (smtplib.SMTPServerDisconnected, smtplib.SMTPConnectError, ConnectionError, OSError):
+                            try: server.quit()
+                            except: pass
+                            server = smtp_connect(smtp_host, smtp_port, _use_ssl, sender_email, sender_pass)
+                            rc = 0
+                            server.send_message(msg)
                         update_log_status(conn, item["id"], "Sent", "", recipients=target_to)
                         sent_count += 1
                     except Exception as e:
                         update_log_status(conn, item["id"], "Failed", str(e), recipients=target_to)
                         failed_count += 1
+                    del msg
+                    gc.collect()
                     rc += 1
                     prog.progress(int(i/total_pending*100))
                     if rc >= RECONNECT_EVERY:
                         try: server.quit()
                         except: pass
-                        if protocol.startswith("SMTPS"):
-                            server = smtplib.SMTP_SSL(smtp_host, int(smtp_port), timeout=60)
-                        else:
-                            server = smtplib.SMTP(smtp_host, int(smtp_port), timeout=60)
-                            server.starttls()
-                        server.login(sender_email, sender_pass)
+                        server = smtp_connect(smtp_host, smtp_port, _use_ssl, sender_email, sender_pass)
                         rc = 0
                     if not skip_delay_chk:
                         time.sleep(float(delay_seconds))
@@ -986,11 +1026,12 @@ with col_send:
                 # ── Live progress UI ──────────────────────────────────────
                 prog        = st.progress(0)
                 pct_ph      = st.empty()   # "47% — 47 of 100 sent"
-                m1, m2, m3  = st.columns(3)
+                m1, m2, m3, m4 = st.columns(4)
                 sent_ph     = m1.empty()
                 remain_ph   = m2.empty()
                 failed_ph   = m3.empty()
-                feed_ph     = st.empty()   # live scrolling table
+                mem_ph      = m4.empty()
+                feed_ph     = st.empty()   # live scrolling table (last 50 rows)
 
                 def _refresh_ui(done, sent, failed, total, log_rows):
                     pct = int(done / total * 100)
@@ -1003,9 +1044,10 @@ with col_send:
                     sent_ph.metric("Sent", sent)
                     remain_ph.metric("Remaining", total - done)
                     failed_ph.metric("Failed", failed)
+                    mem_ph.metric("Memory (MB)", rss_mb())
                     if log_rows:
                         feed_ph.dataframe(
-                            pd.DataFrame(log_rows[::-1]),   # newest on top
+                            pd.DataFrame(log_rows[-50:][::-1]),   # newest on top, last 50 only
                             use_container_width=True,
                             hide_index=True
                         )
@@ -1015,13 +1057,9 @@ with col_send:
                 _refresh_ui(0, 0, 0, total_parts, [])
 
                 try:
-                    if protocol.startswith("SMTPS"):
-                        server = smtplib.SMTP_SSL(smtp_host, int(smtp_port), timeout=60)
-                    else:
-                        server = smtplib.SMTP(smtp_host, int(smtp_port), timeout=60)
-                        server.starttls()
-                    server.login(sender_email, sender_pass)
-                    RECONNECT_EVERY = 100
+                    _use_ssl = protocol.startswith("SMTPS")
+                    server = smtp_connect(smtp_host, smtp_port, _use_ssl, sender_email, sender_pass)
+                    RECONNECT_EVERY = 25
                     rc = 0
                     for (loc, recip_str, halls_key), parts in st.session_state.prepared.items():
                         hall = ", ".join(halls_key)          # display label for the log feed
@@ -1054,7 +1092,15 @@ with col_send:
                             # One log row per part: written as Pending, then updated in place to Sent/Failed.
                             log_id = append_log(conn, {"location": loc, "recipients": target_to, "halltickets": hall_list, "part": f"{idx_part}/{len(parts)}", "file": os.path.basename(pinfo["path"]), "file_path": pinfo["path"], "files_in_part": len(pinfo["files"]), "status": "Pending", "error": ""})
                             try:
-                                server.send_message(msg)
+                                try:
+                                    server.send_message(msg)
+                                except (smtplib.SMTPServerDisconnected, smtplib.SMTPConnectError, ConnectionError, OSError):
+                                    # Server dropped the connection — reconnect once and retry this part
+                                    try: server.quit()
+                                    except: pass
+                                    server = smtp_connect(smtp_host, smtp_port, _use_ssl, sender_email, sender_pass)
+                                    rc = 0
+                                    server.send_message(msg)
                                 update_log_status(conn, log_id, "Sent", "")
                                 sent_count += 1
                                 logs.append({"Location": loc, "Halltickets": hall, "To": target_to, "Part": f"{idx_part}/{len(parts)}", "File": os.path.basename(pinfo["path"]), "Status": "Sent"})
@@ -1062,18 +1108,16 @@ with col_send:
                                 failed_count += 1
                                 update_log_status(conn, log_id, "Failed", str(e))
                                 logs.append({"Location": loc, "Halltickets": hall, "To": target_to, "Part": f"{idx_part}/{len(parts)}", "File": os.path.basename(pinfo["path"]), "Status": f"Failed: {e}"})
+                            # Free the ~3-4x attachment-size buffers (raw + base64 + wire copy) before the next part
+                            del msg
+                            gc.collect()
                             done_count += 1
                             rc += 1
                             _refresh_ui(done_count, sent_count, failed_count, total_parts, logs)
                             if rc >= RECONNECT_EVERY:
                                 try: server.quit()
                                 except: pass
-                                if protocol.startswith("SMTPS"):
-                                    server = smtplib.SMTP_SSL(smtp_host, int(smtp_port), timeout=60)
-                                else:
-                                    server = smtplib.SMTP(smtp_host, int(smtp_port), timeout=60)
-                                    server.starttls()
-                                server.login(sender_email, sender_pass)
+                                server = smtp_connect(smtp_host, smtp_port, _use_ssl, sender_email, sender_pass)
                                 rc = 0
                             if not skip_delay_chk:
                                 time.sleep(float(delay_seconds))
